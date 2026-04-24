@@ -36,20 +36,6 @@ Traditional traffic control methods historically relied on fixed timing schedule
    1. Track performance metrics  
    2. Compare neural network with baseline systems
 
-### Division of Labor:
-
-**Syed Ahmad Shah:**
-
-1. Research and design Neural Network Architecture  
-2. Implementation and training of neural network model  
-3. Data preprocessing and feature selection
-
-**Christina Cuneo:**
-
-1. Design and implement traffic simulation environment  
-2. Research and implement baseline traffic control systems  
-3. Implementation of performance metrics and evaluation  
-4. Assist in research and implementation of a different neural network model for comparison
 
 ### Github Repository Setup:
 

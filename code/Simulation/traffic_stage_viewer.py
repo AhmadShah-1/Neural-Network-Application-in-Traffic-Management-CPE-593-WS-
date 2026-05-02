@@ -4,13 +4,24 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import random
+import warnings
 from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.*")
+
 import pygame
 import torch
+
+try:
+    from State.traffic_config import DECISION_INTERVAL_SECONDS, PHASE_DURATION_CHOICES_SECONDS, PHASES, STATE_NORMALIZATION
+except ImportError:  # pragma: no cover - supports running from inside code/Simulation
+    from ..State.traffic_config import DECISION_INTERVAL_SECONDS, PHASE_DURATION_CHOICES_SECONDS, PHASES, STATE_NORMALIZATION
 
 
 WIDTH, HEIGHT = 1240, 860
@@ -22,7 +33,7 @@ LANE = 30
 STOP_GAP = 82
 QUEUE_SPACING = 31
 CAR_W, CAR_H = 18, 29
-PHASE_SECONDS = 8
+PHASE_SECONDS = DECISION_INTERVAL_SECONDS
 MANUAL_STEP_SECONDS = 1.0
 VISUAL_STEP_POINTS = 7
 
@@ -99,6 +110,7 @@ INITIAL_LANES = {
 }
 
 INITIAL_WAITS = np.array([14.0, 6.0, 18.0, 9.0], dtype=float)
+INITIAL_LANE_WAITS = np.repeat(INITIAL_WAITS[:, None], len(TURN_ORDER), axis=1)
 
 ARRIVAL_PATTERNS = [
     {"A": ["straight"], "B": ["left"], "C": ["right"], "D": ["straight", "right"]},
@@ -156,6 +168,8 @@ class StageSnapshot:
     state_vector: np.ndarray
     q_values: np.ndarray
     recommended_action: int
+    recommended_action_index: int
+    recommended_duration_seconds: int
     applied_action: int | None
     served_movements: list[Movement]
     active_movements: list[ActiveMovement]
@@ -232,15 +246,11 @@ def travel_path(approach, turn):
 
 
 def phase_allows(phase, approach, turn):
-    if phase == 0:
-        return approach in ["A", "C"] and turn in ["straight", "right"]
-    if phase == 1:
-        return approach in ["B", "D"] and turn in ["straight", "right"]
-    if phase == 2:
-        return approach in ["A", "C"] and turn == "left"
-    if phase == 3:
-        return approach in ["B", "D"] and turn == "left"
-    return False
+    if phase < 0 or phase >= len(PHASES):
+        return False
+    approach_index = APPROACH_ORDER.index(approach)
+    phase_config = PHASES[phase]
+    return approach_index in phase_config["approaches"] and turn in phase_config["movement_capacities"]
 
 
 def phase_name(phase_names, phase):
@@ -272,7 +282,7 @@ class StageTrafficSimulation:
             self._make_snapshot(
                 stage=0,
                 queues=queues,
-                wait_times=INITIAL_WAITS.copy(),
+                wait_times=INITIAL_LANE_WAITS.copy(),
                 current_phase=0,
                 time_in_phase=0.0,
                 applied_action=None,
@@ -317,10 +327,11 @@ class StageTrafficSimulation:
             note = "Moved active cars one manual step. Queues stay fixed until the next release."
         else:
             action = base.recommended_action
+            duration_seconds = base.recommended_duration_seconds
             current_phase = action
-            time_in_phase = base.time_in_phase + MANUAL_STEP_SECONDS if action == base.current_phase else 0.0
+            time_in_phase = duration_seconds
             applied_action = action
-            served_movements = self._release_cars(queues, action)
+            served_movements = self._release_cars(queues, action, duration_seconds)
             active_movements = [
                 ActiveMovement(movement.vehicle, movement.destination, movement.order, path_index=-(movement.order * 4))
                 for movement in served_movements
@@ -330,8 +341,8 @@ class StageTrafficSimulation:
                 queues[vehicle.approach][vehicle.turn].append(vehicle)
             for movement in served_movements:
                 passed_counts[movement.vehicle.approach][movement.vehicle.turn] += 1
-            wait_times = self._wait_times_after_release(queues, wait_times, served_movements)
-            note = f"Released cars for {phase_name(self.phase_names, action)}. Use Step Forward to move them."
+            wait_times = self._wait_times_after_release(queues, wait_times, action, duration_seconds)
+            note = f"Released cars for {phase_name(self.phase_names, action)} for {duration_seconds}s. Use Step Forward to move them."
 
         snapshot = self._make_snapshot(
             stage=base.stage + 1,
@@ -377,16 +388,18 @@ class StageTrafficSimulation:
         return {approach: {turn: 0 for turn in TURN_ORDER} for approach in APPROACH_ORDER}
 
     def _state_from(self, queues, wait_times, current_phase, time_in_phase):
-        queue_counts = np.array(
-            [sum(len(queues[approach][turn]) for turn in TURN_ORDER) for approach in APPROACH_ORDER],
+        lane_counts = np.array(
+            [len(queues[approach][turn]) for approach in APPROACH_ORDER for turn in TURN_ORDER],
             dtype=float,
         )
+        lane_waits = np.asarray(wait_times, dtype=float).reshape(len(APPROACH_ORDER), len(TURN_ORDER)).flatten()
         return np.concatenate(
             [
-                queue_counts / 20.0,
-                wait_times / 50.0,
+                lane_counts / STATE_NORMALIZATION["queue"],
+                lane_waits / STATE_NORMALIZATION["wait"],
                 [current_phase / len(self.phase_names)],
-                [time_in_phase / 50.0],
+                [time_in_phase / STATE_NORMALIZATION["phase_time"]],
+                [max(PHASE_SECONDS, time_in_phase) / max(PHASE_DURATION_CHOICES_SECONDS)],
             ]
         )
 
@@ -405,7 +418,11 @@ class StageTrafficSimulation:
         note,
     ):
         state_vector = self._state_from(queues, wait_times, current_phase, time_in_phase)
-        recommended_action, q_values = self.decision_fn(state_vector)
+        recommended_action_index, q_values = self.decision_fn(state_vector)
+        recommended_action, recommended_duration_seconds = self._decode_model_action(
+            recommended_action_index,
+            len(q_values),
+        )
         return StageSnapshot(
             stage=stage,
             queues=copy.deepcopy(queues),
@@ -415,6 +432,8 @@ class StageTrafficSimulation:
             state_vector=state_vector,
             q_values=np.asarray(q_values, dtype=float),
             recommended_action=int(recommended_action),
+            recommended_action_index=int(recommended_action_index),
+            recommended_duration_seconds=int(recommended_duration_seconds),
             applied_action=applied_action,
             served_movements=list(served_movements),
             active_movements=list(active_movements),
@@ -439,58 +458,59 @@ class StageTrafficSimulation:
                 )
         return advanced
 
-    def _wait_times_after_release(self, queues, wait_times, served_movements):
+    def _wait_times_after_release(self, queues, wait_times, action, duration_seconds=PHASE_SECONDS):
         updated = wait_times.copy()
-        served_approaches = {movement.vehicle.approach for movement in served_movements}
-        for i, approach in enumerate(APPROACH_ORDER):
-            queued_after_service = sum(len(queues[approach][turn]) for turn in TURN_ORDER)
-            if queued_after_service == 0:
-                updated[i] = 0
-            elif approach in served_approaches:
-                updated[i] = 0
-            else:
-                updated[i] += PHASE_SECONDS
+        phase = PHASES[action]
+        active_lanes = {
+            (approach_index, TURN_ORDER.index(turn))
+            for approach_index in phase["approaches"]
+            for turn in phase["movement_capacities"]
+        }
+        for approach_index, approach in enumerate(APPROACH_ORDER):
+            for turn_index, turn in enumerate(TURN_ORDER):
+                if not queues[approach][turn]:
+                    updated[approach_index, turn_index] = 0
+                elif (approach_index, turn_index) in active_lanes:
+                    updated[approach_index, turn_index] = max(0, updated[approach_index, turn_index] - duration_seconds)
+                else:
+                    updated[approach_index, turn_index] += duration_seconds
         return updated
 
-    def _release_cars(self, queues, action):
+    def _decode_model_action(self, action_index, q_value_count):
+        if q_value_count == len(self.phase_names):
+            return int(action_index), PHASE_SECONDS
+        duration_count = len(PHASE_DURATION_CHOICES_SECONDS)
+        return (
+            int(action_index) // duration_count,
+            PHASE_DURATION_CHOICES_SECONDS[int(action_index) % duration_count],
+        )
+
+    def _release_cars(self, queues, action, duration_seconds=None):
+        duration_seconds = duration_seconds or PHASE_SECONDS
         movements: list[Movement] = []
-        if action in [0, 1]:
-            active_approaches = ["A", "C"] if action == 0 else ["B", "D"]
-            for approach in active_approaches:
-                released = self._release_from_turns(queues, approach, ["straight", "right"], capacity=2)
-                movements.extend(released)
-        elif action in [2, 3]:
-            active_approaches = ["A", "C"] if action == 2 else ["B", "D"]
-            for approach in active_approaches:
-                released = self._release_from_turns(queues, approach, ["left"], capacity=1)
-                movements.extend(released)
+        if action < 0 or action >= len(PHASES):
+            return movements
+
+        phase = PHASES[action]
+        duration_multiplier = max(1, int(duration_seconds / PHASE_SECONDS))
+        for approach_index in phase["approaches"]:
+            approach = APPROACH_ORDER[approach_index]
+            for turn, cars_per_interval in phase["movement_capacities"].items():
+                capacity = cars_per_interval * duration_multiplier
+                movements.extend(self._release_from_turn(queues, approach, turn, capacity))
 
         ordered = []
         for order, movement in enumerate(movements):
             ordered.append(Movement(movement.vehicle, movement.destination, order))
         return ordered
 
-    def _release_from_turns(self, queues, approach, turn_priority, capacity):
+    def _release_from_turn(self, queues, approach, turn, capacity):
         released: list[Movement] = []
-        # First pass gives each eligible lane a chance, so right turns are visible
-        # instead of always being hidden behind straight-through traffic.
-        for turn in turn_priority:
-            if len(released) >= capacity:
-                break
-            if queues[approach][turn]:
-                vehicle = queues[approach][turn].pop(0)
-                released.append(Movement(vehicle, DESTINATIONS[(approach, turn)], len(released)))
-
         while len(released) < capacity:
-            released_one = False
-            for turn in turn_priority:
-                if queues[approach][turn]:
-                    vehicle = queues[approach][turn].pop(0)
-                    released.append(Movement(vehicle, DESTINATIONS[(approach, turn)], len(released)))
-                    released_one = True
-                    break
-            if not released_one:
+            if not queues[approach][turn]:
                 break
+            vehicle = queues[approach][turn].pop(0)
+            released.append(Movement(vehicle, DESTINATIONS[(approach, turn)], len(released)))
         return released
 
     def _arrivals_for_stage(self, stage):
@@ -695,87 +715,61 @@ def draw_panel(screen, sim, buttons, fonts):
     pygame.draw.line(screen, COLORS["panel_line"], (PANEL_X, 0), (PANEL_X, HEIGHT), 3)
 
     write = panel_writer(screen, fonts)
-    write("Manual Step Viewer", dy=34, font_key="title")
-    write(f"Step: {snapshot.stage}", dy=27)
-    write(f"Current lights: {phase_name(sim.phase_names, snapshot.current_phase)}", COLORS["green"], dy=27)
-    write(f"Light time: {snapshot.time_in_phase:4.1f}s", COLORS["green"], dy=24)
-    if snapshot.active_movements:
-        write("Next: move active cars", COLORS["amber"], dy=24)
-    elif snapshot.applied_action is None:
-        write("Next: apply model phase", COLORS["amber"], dy=24)
-    else:
-        write("Next: apply model phase", COLORS["amber"], dy=24)
-    write(f"Model recommends: {snapshot.recommended_action} {phase_name(sim.phase_names, snapshot.recommended_action)}", COLORS["muted"], dy=29)
+    write("DQN Traffic Viewer", dy=34, font_key="title")
+    write(f"Step {snapshot.stage}", dy=25)
+    write(f"Active: {phase_name(sim.phase_names, snapshot.current_phase)}", COLORS["green"], dy=25)
+    write(f"Green time: {snapshot.time_in_phase:4.0f}s", COLORS["green"], dy=27)
+    write(
+        f"Next: {phase_name(sim.phase_names, snapshot.recommended_action)}"
+        f" / {snapshot.recommended_duration_seconds}s",
+        COLORS["muted"],
+        dy=30,
+    )
 
-    write("Queue table", COLORS["muted"], dy=22, font_key="small")
+    write("Queues and Wait", COLORS["muted"], dy=22, font_key="small")
     counts = sim.lane_counts(snapshot)
     for i, approach in enumerate(APPROACH_ORDER):
         lanes = counts[approach]
         total = sum(lanes.values())
+        max_wait = float(np.max(snapshot.wait_times[i]))
         write(
             f"{approach} L{lanes['left']:02d} S{lanes['straight']:02d} R{lanes['right']:02d}"
-            f" | T{total:02d} | W{snapshot.wait_times[i]:04.1f}s",
+            f" | T{total:02d} | W{max_wait:04.1f}s",
             dy=21,
             font_key="mono",
         )
 
-    write("", dy=4)
-    write("Passed totals", COLORS["muted"], dy=22, font_key="small")
-    for approach in APPROACH_ORDER:
-        passed = snapshot.passed_counts[approach]
-        total = sum(passed.values())
-        write(
-            f"{approach} L{passed['left']:02d} S{passed['straight']:02d} R{passed['right']:02d} | T{total:02d}",
-            dy=19,
-            font_key="mono",
-        )
+    served = len(snapshot.served_movements)
+    moving = len(snapshot.active_movements)
+    arrivals = len(snapshot.arrivals)
+    write("", dy=5)
+    write("Step Summary", COLORS["muted"], dy=22, font_key="small")
+    write(f"released:{served:02d} moving:{moving:02d} arrivals:{arrivals:02d}", dy=21, font_key="mono")
+    if snapshot.applied_action is not None:
+        write(f"applied: {phase_name(sim.phase_names, snapshot.applied_action)}", dy=21, font_key="mono")
+
+    if snapshot.arrivals:
+        grouped = [f"{vehicle.approach}{TURN_LABELS[vehicle.turn]}" for vehicle in snapshot.arrivals]
+        write("arr: " + ", ".join(grouped[:12]), dy=24, font_key="mono")
 
     write("", dy=5)
-    write("Cars in motion", COLORS["muted"], dy=22, font_key="small")
-    if snapshot.active_movements:
-        for movement in snapshot.active_movements[:5]:
-            v = movement.vehicle
-            write(
-                f"car {v.id:02d}: {v.approach} {v.turn[:1].upper()} -> {movement.destination}"
-                f" | {movement_progress_percent(movement):03d}%",
-                dy=19,
-                font_key="mono",
-            )
-    elif snapshot.served_movements:
-        for movement in snapshot.served_movements[:5]:
-            v = movement.vehicle
-            write(f"car {v.id:02d}: {v.approach} {v.turn[:1].upper()} -> {movement.destination}", dy=19, font_key="mono")
-    else:
-        write("none - Step Forward releases cars", dy=20, font_key="mono")
+    write("Top Actions", COLORS["muted"], dy=22, font_key="small")
+    duration_count = len(PHASE_DURATION_CHOICES_SECONDS)
+    top_indices = np.argsort(snapshot.q_values)[-4:][::-1]
+    for i in top_indices:
+        value = snapshot.q_values[i]
+        if len(snapshot.q_values) == len(sim.phase_names):
+            phase_index = i
+            duration = PHASE_SECONDS
+        else:
+            phase_index = i // duration_count
+            duration = PHASE_DURATION_CHOICES_SECONDS[i % duration_count]
+        marker = "*" if i == snapshot.recommended_action_index else " "
+        write(f"{marker}{phase_name(sim.phase_names, phase_index):10s} {duration:02d}s {value:7.2f}", dy=20, font_key="mono")
 
     write("", dy=4)
-    write("Arrivals this stage", COLORS["muted"], dy=22, font_key="small")
-    if snapshot.arrivals:
-        grouped = []
-        for vehicle in snapshot.arrivals:
-            grouped.append(f"{vehicle.approach}{TURN_LABELS[vehicle.turn]}")
-        write(", ".join(grouped), dy=27, font_key="mono")
-    else:
-        write("none", dy=27, font_key="mono")
-
-    write("Q-values", COLORS["muted"], dy=22, font_key="small")
-    for i, value in enumerate(snapshot.q_values):
-        marker = "*" if i == snapshot.recommended_action else " "
-        write(f"{marker}{i} {phase_name(sim.phase_names, i):10s} {value:7.3f}", dy=19, font_key="mono")
-
-    write("", dy=4)
-    write("Model input", COLORS["muted"], dy=22, font_key="small")
-    labels = ["Aq", "Bq", "Cq", "Dq", "Aw", "Bw", "Cw", "Dw", "ph", "tp"]
-    row = " ".join(f"{label}:{value:.2f}" for label, value in zip(labels[:4], snapshot.state_vector[:4]))
-    write(row, dy=18, font_key="mono")
-    row = " ".join(f"{label}:{value:.2f}" for label, value in zip(labels[4:8], snapshot.state_vector[4:8]))
-    write(row, dy=18, font_key="mono")
-    row = " ".join(f"{label}:{value:.2f}" for label, value in zip(labels[8:], snapshot.state_vector[8:]))
-    write(row, dy=28, font_key="mono")
-
-    write("Controls", COLORS["muted"], dy=22, font_key="small")
-    write("Two buttons only: back/forward.", dy=22, font_key="mono")
-    write("Left/Right keys also work.", dy=22, font_key="mono")
+    write("State", COLORS["muted"], dy=22, font_key="small")
+    write(f"{len(snapshot.state_vector)} inputs: 12 queues, 12 waits, phase/time/duration", dy=38, font_key="mono")
 
     draw_button(screen, buttons["prev"], fonts, enabled=sim.can_go_back())
     draw_button(screen, buttons["next"], fonts, enabled=sim.can_go_forward())
